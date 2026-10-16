@@ -55,18 +55,18 @@ check_for_heresy()
 
 print_step("Start building project")
 os.system("cargo build --release")
-func_dir = os.path.expanduser("~/.local/share/calc/functions")
+func_dir = os.path.expanduser("~/.local/share/scalc/functions")
 os.makedirs(func_dir, exist_ok=True)
 print_step(f"Functions directory ensured at: {func_dir}")
 
-user_input = input("Copy binary to /usr/bin/calc? (y/N): ").strip().lower()
+user_input = input("Copy binary to /usr/bin/scalc? (y/N): ").strip().lower()
 if user_input in ('y', 'yes'):
-	os.system("sudo cp target/release/Simple_calc /usr/bin/calc")
-	print_step("Binary installed to /usr/bin/calc")
+	os.system("sudo cp target/release/Simple_calc /usr/bin/scalc")
+	print_step("Binary installed to /usr/bin/scalc")
 else:
 	user_bin = os.path.expanduser("~/.local/bin")
 	os.makedirs(user_bin, exist_ok=True)
-	os.system(f"cp target/release/Simple_calc {user_bin}/calc")
-	print_step(f"Binary installed to {user_bin}/calc (make sure it's in your PATH)")
+	os.system(f"cp target/release/Simple_calc {user_bin}/scalc")
+	print_step(f"Binary installed to {user_bin}/scalc (make sure it's in your PATH)")
 
-print_step("Installation complete! Type 'calc' to start.")
+print_step("Installation complete! Type 'scalc' to start.")

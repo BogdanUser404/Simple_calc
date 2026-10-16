@@ -91,7 +91,7 @@ fn parse_var_assignment(s: &str) -> Option<(String, i128)> {
 }
 fn get_functions_dir() -> PathBuf {
 	let home = env::var("HOME").unwrap_or_else(|_| ".".to_string());
-	PathBuf::from(home).join(".local").join("share").join("calc").join("functions")
+	PathBuf::from(home).join(".local").join("share").join("scalc").join("functions")
 }
 fn load_math_function(name: &str) -> Result<(usize, String), String> {
 	let func_dir = get_functions_dir();
