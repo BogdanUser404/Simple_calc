@@ -1,6 +1,6 @@
 # Functions 
 
-The functions are located in $HOME/.local/scalc/functions 
+The functions are located in $HOME/.local/share/functions 
 There are two types of functions: 
 Rhai scripts 
 Mathematical expressions 
