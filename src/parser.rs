@@ -1,17 +1,14 @@
 // Copyright (C) 2026 Bogdan Yachmenev.
 // License: AGPL v3.0 or later
-
 pub struct Lexer<'a> {
 	input: std::iter::Peekable<std::str::Chars<'a>>,
 }
-
 impl<'a> Lexer<'a> {
 	pub fn new(input: &'a str) -> Self {
 		Self {
 			input: input.chars().peekable(),
 		}
 	}
-
 	pub fn next_token(&mut self) -> Result<Option<String>, &'static str> {
 		while let Some(&c) = self.input.peek() {
 			if c.is_whitespace() {
@@ -20,17 +17,14 @@ impl<'a> Lexer<'a> {
 				break;
 			}
 		}
-
 		let c = match self.input.next() {
 			Some(ch) => ch,
 			None => return Ok(None),
 		};
-
 		// 1. Numbers with floating point auto-scaled to exactly 10^8
 		if c.is_ascii_digit() {
 			let mut int_digits = String::new();
 			let mut frac_digits = String::new();
-			
 			int_digits.push(c);
 			while let Some(&next_c) = self.input.peek() {
 				if next_c.is_ascii_digit() {
@@ -39,7 +33,6 @@ impl<'a> Lexer<'a> {
 					break;
 				}
 			}
-
 			if let Some(&'.') = self.input.peek() {
 				self.input.next(); // Consume '.'
 				while let Some(&next_c) = self.input.peek() {
@@ -50,10 +43,8 @@ impl<'a> Lexer<'a> {
 					}
 				}
 			}
-
 			let mut integer_part: i128 = int_digits.parse().map_err(|_| "Invalid integer format")?;
 			integer_part = integer_part.checked_mul(100_000_000).ok_or("Overflow")?;
-
 			let mut fractional_part: i128 = 0;
 			if !frac_digits.is_empty() {
 				let len = frac_digits.len();
@@ -66,11 +57,9 @@ impl<'a> Lexer<'a> {
 					fractional_part = truncated.parse().map_err(|_| "Invalid fractional format")?;
 				}
 			}
-
 			let final_fixed_val = integer_part.checked_add(fractional_part).ok_or("Overflow")?;
 			return Ok(Some(final_fixed_val.to_string()));
 		}
-
 		// 2. Strict Multicharacter Word Tokenization (No implicit multiplication like xyz)
 		if c.is_ascii_alphabetic() || c == '¬' {
 			let mut word = String::new();
@@ -84,7 +73,6 @@ impl<'a> Lexer<'a> {
 			}
 			return Ok(Some(word));
 		}
-
 		// 3. Multicharacter operators and single characters
 		match c {
 			'<' | '>' => {
@@ -127,13 +115,10 @@ impl<'a> Lexer<'a> {
 		}
 	}
 }
-
 pub struct ParsingEngine;
-
 impl ParsingEngine {
 	pub fn parse_into_processor(input: &str, processor: &mut crate::math_proccessor::MathProcessor) -> Result<(), &'static str> {
 		let mut lexer = Lexer::new(input);
-		
 		while let Some(token) = lexer.next_token()? {
 			match token.as_str() {
 				"(" => processor.open_bracket(),
