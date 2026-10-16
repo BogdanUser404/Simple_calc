@@ -1,6 +1,12 @@
 # How to use? 
-Simple calc is an infix notation calculator. 
-The install.py installation script copies the calculator to /usr/bin or ~/.local/bin. 
+Simple calc is an infix notation fixed-point calculator (8 decimal places). 
+The install.py installation script copies the calculator to /usr/bin or ~/.local/bin.
+
+Features: arithmetic and bitwise operators, comparisons (with Russian word
+aliases like БОЛЬШЕ/МЕНЬШЕ/РАВНО), real variables (`set X 5`, `X = {X} * 2`),
+lazy conditional branching `IF[cond]:(then):(else)`, user-defined `.math` and
+`.rhai` functions, a REPL and one-shot CLI mode.
+See the full [Feature Documentation](./doc/features.md).
  
 Operators: 
 * `+` — Addition 
@@ -21,7 +27,10 @@ Operators:
 * `gcd` — Greatest Common Divisor (GCD)
 * `lcm` — Least Common Multiple (LCM)
 * `rand` — Random number 
-* `FUNCNAME[args]` - Call the fucntion 
+* `>` `<` `=` `==` `!=` `≠` `<=` `>=` — Comparisons (return 1 or 0; Russian aliases: БОЛЬШЕ, МЕНЬШЕ, РАВНО, НЕ_РАВНО, ...) 
+* `IF[cond]:(then):(else)` — Lazy conditional branching 
+* `set NAME VALUE`, `NAME = VALUE`, `{NAME}` or bare `NAME` — Variables 
+* `FUNCNAME[args]` - Call the function 
 
 Example: 
 ```bash
@@ -37,3 +46,4 @@ The parser simply assembles the math st
 ack from strings.
 
 [Function Doc](./doc/function.md)
+[Feature Documentation](./doc/features.md)
