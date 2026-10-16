@@ -62,10 +62,11 @@ os.system("cargo build --release");
 user_input = input("Copy binary to /usr/bin/calc? (y/N): ").strip().lower();
 if user_input in ('y', 'yes'):
 	os.system("sudo cp target/release/Simple_calc /usr/bin/calc");
-	print_step("Binary installed to /usr/bin/arrowc");
+	print_step("Binary installed to /usr/bin/calc");
 else:
 	user_bin = os.path.expanduser("~/.local/bin");
 	os.makedirs(user_bin, exist_ok=True);
 	os.system(f"cp target/release/Simple_calc {user_bin}/calc");
+	os.system(f"mkdir -p $HOME/.local/share/calc/functions");
 	print_step(f"Binary installed to {user_bin}/calc PATH needed");
 
