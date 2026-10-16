@@ -157,24 +157,85 @@ fn execute_rhai_function(name: &str, args: &[i128]) -> Result<i128, String> {
 	
 	let mut engine = Engine::new();
 	
-	// Register fixed-point type and operations
 	engine.register_type_with_name::<i128>("FixedPoint");
-	
 	engine.register_fn("to_fixed", |x: i64| -> i128 { (x as i128) * SCALE });
 	engine.register_fn("to_fixed", |x: f64| -> i128 { (x * SCALE as f64) as i128 });
 	engine.register_fn("to_raw", |x: i128| -> i64 { (x / SCALE) as i64 });
 	engine.register_fn("to_float", |x: i128| -> f64 { x as f64 / SCALE as f64 });
-	
+
 	engine.register_fn("+", |a: i128, b: i128| -> i128 { a + b });
 	engine.register_fn("-", |a: i128, b: i128| -> i128 { a - b });
 	engine.register_fn("*", |a: i128, b: i128| -> i128 { a * b / SCALE });
-	engine.register_fn("/", |a: i128, b: i128| -> i128 { a * SCALE / b });
-	engine.register_fn("**", |a: i128, b: i128| -> i128 { 
-		crate::math_operations::pow(a, b).unwrap_or(0)
+	engine.register_fn("/", |a: i128, b: i128| -> i128 {
+		if b == 0 { panic!("Division by zero"); }
+		a * SCALE / b
+	});
+	engine.register_fn("**", |a: i128, b: i128| -> i128 {
+		crate::math_operations::pow(a, b).unwrap_or_else(|e| panic!("{}", e))
 	});
 	
-	let args_array: Array = args.iter().map(|&x| Dynamic::from(x)).collect();
+	engine.register_fn("&", |a: i128, b: i128| -> i128 { (a / SCALE) & (b / SCALE) * SCALE });
+	engine.register_fn("|", |a: i128, b: i128| -> i128 { ((a / SCALE) | (b / SCALE)) * SCALE });
+	engine.register_fn("xor", |a: i128, b: i128| -> i128 { ((a / SCALE) ^ (b / SCALE)) * SCALE });
+	engine.register_fn("<<", |a: i128, b: i128| -> i128 {
+		((a / SCALE) << (b / SCALE) as u32) * SCALE
+	});
+	engine.register_fn(">>", |a: i128, b: i128| -> i128 {
+		((a / SCALE) >> (b / SCALE) as u32) * SCALE
+	});
 	
+	engine.register_fn("nand", |a: i128, b: i128| -> i128 {
+		(!((a / SCALE) & (b / SCALE))) * SCALE
+	});
+	engine.register_fn("nor", |a: i128, b: i128| -> i128 {
+		(!((a / SCALE) | (b / SCALE))) * SCALE
+	});
+	engine.register_fn("not", |a: i128| -> i128 { !(a / SCALE) * SCALE });
+	
+	engine.register_fn("gcd", |a: i128, b: i128| -> i128 {
+		let mut x = (a / SCALE).abs();
+		let mut y = (b / SCALE).abs();
+		while y != 0 { let t = x % y; x = y; y = t; }
+		x * SCALE
+	});
+	engine.register_fn("lcm", |a: i128, b: i128| -> i128 {
+		let x = (a / SCALE).abs();
+		let y = (b / SCALE).abs();
+		if x == 0 || y == 0 { return 0; }
+		let (mut gx, mut gy) = (x, y);
+		while gy != 0 { let t = gx % gy; gx = gy; gy = t; }
+		(x / gx) * y * SCALE
+	});
+	engine.register_fn("fact", |a: i128| -> i128 {
+		let n = a / SCALE;
+		if n < 0 { panic!("Factorial of negative number"); }
+		let mut f: i128 = 1;
+		for i in 1..=n { f = f.checked_mul(i).expect("Factorial overflow"); }
+		f * SCALE
+	});
+	engine.register_fn("subfact", |a: i128| -> i128 {
+		let n = a / SCALE;
+		if n < 0 { panic!("Subfactorial of negative number"); }
+		let mut sub: i128 = 1;
+		if n > 0 {
+			let mut p1: i128 = 1;
+			let mut p2: i128 = 0;
+			sub = p2;
+			for i in 2..=n {
+				sub = (i - 1) * (p1 + p2);
+				p1 = p2;
+				p2 = sub;
+			}
+		}
+		sub * SCALE
+	});
+	
+	let rand_engine = crate::math_operations::RandomEngine::new();
+	engine.register_fn("rand", move || -> i128 {
+		let raw = rand_engine.next_rand(0);
+		(raw.abs() % SCALE) * (SCALE / 100_000_000)
+	});
+	let args_array: Array = args.iter().map(|&x| Dynamic::from(x)).collect();
 	let mut scope = Scope::new();
 	scope.push("args", args_array);
 	
