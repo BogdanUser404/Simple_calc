@@ -30,7 +30,14 @@ if fractional_part == 0 {
 	}
 }
 }
-fn apply_placeholders(expr: &str, vars: &HashMap<String, i128>) -> Result<String, String> {
+/// Substitutes variables into `expr`, supporting BOTH real variables
+/// written as bare identifiers (`x + 1`) and the legacy `{name}`
+/// placeholder syntax. A bare name is replaced only when it is a valid
+/// identifier (starts with a letter or underscore, continues with letters,
+/// digits or underscores); everything else is copied verbatim so that IF
+/// constructs, function-call brackets and operators are never damaged.
+/// Unknown names produce an error listing the currently defined variables.
+fn apply_variables(expr: &str, vars: &HashMap<String, i128>) -> Result<String, String> {
 	let mut result = String::with_capacity(expr.len());
 	let mut chars = expr.chars().peekable();
 	while let Some(c) = chars.next() {
@@ -46,15 +53,45 @@ fn apply_placeholders(expr: &str, vars: &HashMap<String, i128>) -> Result<String
 				name.push(nc);
 			}
 			if !closed {
-				return Err(format!("Unmatched '{{' in placeholder: {{{}", name));
+				return Err(format!("Unmatched '{{' in variable reference: {{{}", name));
 			}
 			let name = name.trim().to_string();
 			if name.is_empty() {
-				return Err("Empty placeholder name".to_string());
+				return Err("Empty variable name".to_string());
 			}
-			match vars.get(&name) {
-				Some(&val) => result.push_str(&format_fixed_point(val)),
-				None => return Err(format!("Undefined placeholder: {{{}}}", name)),
+			match lookup_var(vars, &name) {
+				Some(val) => result.push_str(&format_fixed_point(val)),
+				None => return Err(unknown_var_message(&name, vars)),
+			}
+		} else if c.is_alphabetic() || c == '_' {
+			// Real variable written as a bare identifier (e.g. `x`, `my_var2`
+			// or Cyrillic names like `ИКС`). Non-identifier words such as the
+			// `IF` keyword are copied verbatim so branch constructs survive.
+			let mut name = String::new();
+			name.push(c);
+			while let Some(&nc) = chars.peek() {
+				if nc.is_alphanumeric() || nc == '_' {
+					name.push(nc);
+					chars.next();
+				} else {
+					break;
+				}
+			}
+			// Operator words (`xor`, `gcd`, ...) are handled by the parser
+			// itself — they must never be treated as variable names.
+			if is_operator_word(&name) || name == "IF" {
+				// Operator words and the `IF` keyword pass through untouched;
+				// an uppercase `IF` immediately followed by `[` is always the
+				// branch construct, never a variable reference.
+				result.push_str(&name);
+			} else if name == "if" && chars.peek() == Some(&'[') {
+				// Lowercase `if[...]` alias of the IF keyword — also verbatim.
+				result.push_str(&name);
+			} else {
+				match lookup_var(vars, &name) {
+					Some(val) => result.push_str(&format_fixed_point(val)),
+					None => return Err(unknown_var_message(&name, vars)),
+				}
 			}
 		} else {
 			result.push(c);
@@ -62,34 +99,138 @@ fn apply_placeholders(expr: &str, vars: &HashMap<String, i128>) -> Result<String
 	}
 	Ok(result)
 }
-fn parse_var_assignment(s: &str) -> Option<(String, i128)> {
-	if let Some(eq_pos) = s.find('=') {
-		let name = s[..eq_pos].trim().to_string();
-		let val_str = s[eq_pos + 1..].trim();
-		if name.is_empty() {
-			return None;
-		}
-		if let Some(dot_pos) = val_str.find('.') {
-			let int_part: i128 = val_str[..dot_pos].parse().ok()?;
-			let frac_str = &val_str[dot_pos + 1..];
-			let len = frac_str.len();
-			let frac_val: i128 = frac_str.parse().ok()?;
-			let multiplier = if len <= 8 {
-				10i128.pow((8 - len) as u32)
-			} else {
-				let truncated: String = frac_str.chars().take(8).collect();
-				truncated.parse().ok()?
-			};
-			let frac_scaled = frac_val.checked_mul(multiplier)?;
-			let total = int_part.checked_mul(SCALE)?.checked_add(frac_scaled)?;
-			Some((name, total))
-		} else {
-			let int_val: i128 = val_str.parse().ok()?;
-			Some((name, int_val.checked_mul(SCALE)?))
-		}
+
+/// Returns true for words that the math engine treats as operators rather
+/// than variable names, so they must never be substituted.
+fn is_operator_word(name: &str) -> bool {
+	matches!(name, "not" | "xor" | "gcd" | "lcm" | "rand")
+}
+
+/// Looks up a variable value, accepting both the exact name and its
+/// trimmed form (legacy placeholders could contain surrounding spaces).
+fn lookup_var(vars: &HashMap<String, i128>, name: &str) -> Option<i128> {
+	if let Some(&v) = vars.get(name) {
+		return Some(v);
+	}
+	let trimmed = name.trim();
+	if trimmed != name {
+		vars.get(trimmed).copied()
 	} else {
 		None
 	}
+}
+
+/// Builds the error message for an unknown variable, listing what IS
+/// defined so the user gets a helpful hint instead of a generic failure.
+fn unknown_var_message(name: &str, vars: &HashMap<String, i128>) -> String {
+	if vars.is_empty() {
+		format!("Undefined variable '{}'. No variables are defined yet (use 'set NAME VALUE' in the REPL or NAME=VALUE CLI arguments).", name)
+	} else {
+		let mut defined: Vec<&String> = vars.keys().collect();
+		defined.sort();
+		format!(
+			"Undefined variable '{}'. Defined variables: {}",
+			name,
+			defined.iter().map(|k| k.as_str()).collect::<Vec<_>>().join(", ")
+		)
+	}
+}
+/// Parses a numeric literal written in decimal into fixed-point (scale
+/// 10^8). Handles an optional leading sign and optional fractional part.
+fn parse_fixed_literal(val_str: &str) -> Option<i128> {
+	let (sign, body) = match val_str.strip_prefix('-') {
+		Some(rest) => (-1i128, rest.trim()),
+		None => (1i128, val_str.strip_prefix('+').unwrap_or(val_str).trim()),
+	};
+	if let Some(dot_pos) = body.find('.') {
+		let int_part: i128 = if dot_pos == 0 { 0 } else { body[..dot_pos].parse().ok()? };
+		let frac_str = &body[dot_pos + 1..];
+		let len = frac_str.len();
+		let (frac_val, multiplier) = if len == 0 {
+			(0, 0)
+		} else if len <= 8 {
+			(frac_str.parse::<i128>().ok()?, 10i128.pow((8 - len) as u32))
+		} else {
+			let truncated: String = frac_str.chars().take(8).collect();
+			(truncated.parse().ok()?, 1)
+		};
+		let frac_scaled = frac_val.checked_mul(multiplier)?;
+		let total = int_part.checked_mul(SCALE)?.checked_add(frac_scaled)?;
+		sign.checked_mul(total)
+	} else {
+		let int_val: i128 = body.parse().ok()?;
+		int_val.checked_mul(SCALE).and_then(|v| sign.checked_mul(v))
+	}
+}
+/// Evaluates the right-hand side of a REPL assignment. Plain literals
+/// (`X = 5`, `X = -3.25`, `X = 3434545435`) are parsed directly; anything
+/// else is run through the full engine so expressions, comparisons and
+/// nested variables all work (`X = {X} * 2 + 1`, `Y = X > 100`).
+fn eval_assign_rhs(rhs: &str, vars: &HashMap<String, i128>) -> Result<i128, String> {
+	if let Some(v) = parse_fixed_literal(rhs) {
+		return Ok(v);
+	}
+	let with_vars = apply_variables(rhs, vars)?;
+	let expanded = expand_if_constructs(&with_vars, vars)?;
+	let mut processor = MathProcessor::new();
+	ParsingEngine::parse_into_processor_with_vars(&expanded, &mut processor, vars)
+		.map_err(|e| format!("Parse error in assignment: {}", e))?;
+	processor
+		.finalize()
+		.map_err(|e| format!("Evaluation error in assignment: {}", e))
+}
+/// Splits `s` at the first top-level `=` (ignoring `=` inside brackets or
+/// after `<`, `>`, `!`, so comparison operators are never mistaken for an
+/// assignment). Returns `(name, rhs)` when both sides are non-empty.
+fn split_assignment(s: &str) -> Option<(String, String)> {
+	let bytes = s.as_bytes();
+	let mut depth = 0i32;
+	let mut i = 0;
+	while i < bytes.len() {
+		match bytes[i] {
+			b'(' | b'[' => depth += 1,
+			b')' | b']' => depth -= 1,
+			b'=' if depth == 0 => {
+				// Skip `==`, and comparisons `<=`, `>=`, `!=`.
+				if bytes.get(i + 1) == Some(&b'=') {
+					i += 2;
+					continue;
+				}
+				if i > 0 && matches!(bytes[i - 1], b'<' | b'>' | b'!') {
+					i += 1;
+					continue;
+				}
+				let name = s[..i].trim().to_string();
+				let rhs = s[i + 1..].trim().to_string();
+				if name.is_empty() || rhs.is_empty() || name.contains(' ') {
+					return None;
+				}
+				return Some((name, rhs));
+			}
+			_ => {}
+		}
+		i += 1;
+	}
+	None
+}
+fn parse_var_assignment(s: &str, vars: &HashMap<String, i128>) -> Option<(String, i128)> {
+	// Form 1: `NAME = EXPR` — RHS may be a literal OR any expression
+	// (evaluated via the full engine with the current variable table).
+	if let Some((name, rhs)) = split_assignment(s) {
+		let value = eval_assign_rhs(&rhs, vars).ok()?;
+		return Some((name, value));
+	}
+	// Form 2: `NAME VALUE` (used by `set NAME VALUE` after stripping `set `).
+	if let Some(sp_pos) = s.find(' ') {
+		let name = s[..sp_pos].trim().to_string();
+		let val_str = s[sp_pos + 1..].trim();
+		if name.is_empty() || val_str.is_empty() {
+			return None;
+		}
+		let value = eval_assign_rhs(val_str, vars).ok()?;
+		return Some((name, value));
+	}
+	None
 }
 fn get_functions_dir() -> PathBuf {
 	let home = env::var("HOME").unwrap_or_else(|_| ".".to_string());
@@ -140,10 +281,10 @@ fn execute_math_function(name: &str, args: &[i128], vars: &HashMap<String, i128>
 		local_vars.insert(format!("ARG_{}", i + 1), arg_val);
 	}
 	
-	let expanded = apply_placeholders(&expr_template, &local_vars)?;
+	let expanded = apply_variables(&expr_template, &local_vars)?;
 	
 	let mut processor = MathProcessor::new();
-	ParsingEngine::parse_into_processor(&expanded, &mut processor)
+	ParsingEngine::parse_into_processor_with_vars(&expanded, &mut processor, &local_vars)
 		.map_err(|e| format!("Parse error in function '{}': {}", name, e))?;
 	
 	processor.finalize()
@@ -405,10 +546,10 @@ pub fn find_if_construct(expr: &str, from: usize) -> Option<(usize, usize)> {
 /// their lazily-computed numeric literals, and finally runs the result
 /// through the engine's parser/processor.
 fn eval_branch_part(expr: &str, vars: &HashMap<String, i128>) -> Result<i128, String> {
-    let with_vars = apply_placeholders(expr, vars)?;
+    let with_vars = apply_variables(expr, vars)?;
     let expanded = expand_if_constructs(&with_vars, vars)?;
     let mut processor = MathProcessor::new();
-    ParsingEngine::parse_into_processor(&expanded, &mut processor)
+    ParsingEngine::parse_into_processor_with_vars(&expanded, &mut processor, vars)
         .map_err(|e| format!("Parse error in branch expression '{}': {}", expanded, e))?;
     processor
         .finalize()
@@ -452,24 +593,30 @@ fn expand_if_constructs(expr: &str, vars: &HashMap<String, i128>) -> Result<Stri
     Err("Too deeply nested IF constructs".to_string())
 }
 
-/// Entry point used by `execute_expression`: expands all IF constructs
-/// (lazily, recursively, with placeholder support) before the remaining
-/// arithmetic is evaluated by the main processor.
-fn expand_branches(expr: &str, vars: &HashMap<String, i128>) -> Result<String, String> {
-    let with_vars = apply_placeholders(expr, vars)?;
-    expand_if_constructs(&with_vars, vars)
-}
+
 
 fn execute_expression(expr: &str, vars: &HashMap<String, i128>) {
 	if expr.trim().is_empty() {
 		return;
 	}
 
-	// Expand all lazy IF constructs first (recursively, placeholders
-	// included). This must happen BEFORE the user-function dispatch,
-	// otherwise expressions like "IF[...]:(...):(...)" would be mistaken
-	// for a call to a user-defined function named "IF".
-	let expanded = match expand_branches(expr, vars) {
+	// Substitute real variables (bare identifiers and legacy {name}
+	// syntax) exactly once, before any other processing. Doing it up
+	// front means IF constructs, function arguments and nested calls
+	// all see plain numeric literals.
+	let with_vars = match apply_variables(expr, vars) {
+		Ok(s) => s,
+		Err(e) => {
+			eprintln!("Variable Error: {}", e);
+			return;
+		}
+	};
+
+	// Expand all lazy IF constructs next (recursively). This must
+	// happen BEFORE the user-function dispatch, otherwise expressions
+	// like "IF[...]:(...):(...)" would be mistaken for a call to a
+	// user-defined function named "IF".
+	let expanded = match expand_if_constructs(&with_vars, vars) {
 		Ok(s) => s,
 		Err(e) => {
 			eprintln!("Branch Error: {}", e);
@@ -481,16 +628,11 @@ fn execute_expression(expr: &str, vars: &HashMap<String, i128>) {
 	if let Some((func_name, arg_strs)) = parse_function_call(&expanded) {
 		let mut arg_values = Vec::new();
 		for arg_str in arg_strs {
-			let expanded = match apply_placeholders(&arg_str, vars) {
-				Ok(s) => s,
-				Err(e) => {
-					eprintln!("Placeholder Error: {}", e);
-					return;
-				}
-			};
-			
+			// Variables were already substituted at the top of
+			// `execute_expression`; parse the argument directly (the parser
+			// still resolves any remaining bare identifiers defensively).
 			let mut processor = MathProcessor::new();
-			match ParsingEngine::parse_into_processor(&expanded, &mut processor) {
+			match ParsingEngine::parse_into_processor_with_vars(&arg_str, &mut processor, vars) {
 				Ok(_) => {
 					match processor.finalize() {
 						Ok(result) => arg_values.push(result),
@@ -529,7 +671,7 @@ fn execute_expression(expr: &str, vars: &HashMap<String, i128>) {
 	// Plain expression: IF constructs are already expanded above;
 	// evaluate the remaining arithmetic through the processor.
 	let mut processor = MathProcessor::new();
-	match ParsingEngine::parse_into_processor(&expanded, &mut processor) {
+	match ParsingEngine::parse_into_processor_with_vars(&expanded, &mut processor, vars) {
 		Ok(_) => {
 			match processor.finalize() {
 				Ok(result) => println!("{}", format_fixed_point(result)),
@@ -540,65 +682,83 @@ fn execute_expression(expr: &str, vars: &HashMap<String, i128>) {
 	}
 }
 fn run_repl() {
-	println!("Simple Fixed-Point Calculator (8 decimals) - Bogdan Yachmenev");
-	println!("Type your expression and press Enter. Type 'exit' or 'quit' to stop.");
-	println!("Use 'set NAME VALUE' to define placeholders like {{NAME}}.\n");
-	let mut vars: HashMap<String, i128> = HashMap::new();
-	let mut input = String::new();
-	loop {
-		print!("calc> ");
-		if io::stdout().flush().is_err() {
-			eprintln!("Error flushing stdout");
-			break;
-		}
-		input.clear();
-		if io::stdin().read_line(&mut input).is_err() {
-			eprintln!("Error reading input");
-			break;
-		}
-		let trimmed = input.trim();
-		if trimmed.is_empty() {
-			continue;
-		}
-		if trimmed == "exit" || trimmed == "quit" {
-			break;
-		}
-		if trimmed.starts_with("set ") {
-			let rest = trimmed[4..].trim();
-			let mut parts = rest.splitn(2, char::is_whitespace);
-			let name = parts.next().unwrap_or("").trim();
-			let val_str = parts.next().unwrap_or("").trim();
-			if name.is_empty() || val_str.is_empty() {
-				eprintln!("Usage: set NAME VALUE");
-				continue;
-			}
-			let assign = format!("{}={}", name, val_str);
-			match parse_var_assignment(&assign) {
-				Some((n, v)) => {
-					vars.insert(n.clone(), v);
-					println!("{} = {}", n, format_fixed_point(v));
-				}
-				None => eprintln!("Invalid value for '{}'", name),
-			}
-			continue;
-		}
-		if trimmed == "list" {
-			if vars.is_empty() {
-				println!("(no placeholders defined)");
-			} else {
-				for (k, v) in &vars {
-					println!("{} = {}", k, format_fixed_point(*v));
-				}
-			}
-			continue;
-		}
-		if trimmed == "clear" {
-			vars.clear();
-			println!("All placeholders cleared.");
-			continue;
-		}
-		execute_expression(trimmed, &vars);
-	}
+ 	println!("Simple Fixed-Point Calculator (8 decimals) - Bogdan Yachmenev");
+ 	println!("Type your expression and press Enter. Type 'exit' or 'quit' to stop.");
+ 	println!("Real variables: 'set NAME VALUE' defines a variable usable as bare NAME or {{NAME}}.");
+ 	println!("Commands: set NAME VALUE | NAME = VALUE | let NAME = VALUE | unset NAME | list | clear\n");
+ 	let mut vars: HashMap<String, i128> = HashMap::new();
+ 	let mut input = String::new();
+ 	loop {
+ 		print!("calc> ");
+ 		if io::stdout().flush().is_err() {
+ 			eprintln!("Error flushing stdout");
+ 			break;
+ 		}
+ 		input.clear();
+ 		if io::stdin().read_line(&mut input).is_err() {
+ 			eprintln!("Error reading input");
+ 			break;
+ 		}
+ 		let trimmed = input.trim();
+ 		if trimmed.is_empty() {
+ 			continue;
+ 		}
+ 		if trimmed == "exit" || trimmed == "quit" {
+ 			break;
+ 		}
+ 		// `set NAME EXPR`, `let NAME = EXPR` and `NAME = EXPR` all define a
+ 		// real variable usable by its bare name (or {NAME}) in any expression
+ 		// — including dynamic re-assignment like `X = X * 2 + 1`, where the
+ 		// right-hand side is evaluated with the OLD value of X first.
+ 		let assign_str = if let Some(rest) = trimmed.strip_prefix("set ") {
+ 			Some(rest.trim().to_string())
+ 		} else if let Some(rest) = trimmed.strip_prefix("let ") {
+ 			Some(rest.trim().to_string())
+ 		} else if !trimmed.starts_with("IF[") && split_assignment(trimmed).is_some() {
+ 			Some(trimmed.to_string())
+ 		} else {
+ 			None
+ 		};
+ 		if let Some(assign) = assign_str {
+ 			match parse_var_assignment(&assign, &vars) {
+ 				Some((n, v)) => {
+ 					vars.insert(n.clone(), v);
+ 					println!("{} = {}", n, format_fixed_point(v));
+ 				}
+ 				None => eprintln!("Invalid variable assignment: '{}' (usage: set NAME VALUE)", assign),
+ 			}
+ 			continue;
+ 		}
+ 		if let Some(name) = trimmed.strip_prefix("unset ") {
+ 			let name = name.trim();
+ 			if name.is_empty() {
+ 				eprintln!("Usage: unset NAME");
+ 			} else if vars.remove(name).is_some() {
+ 				println!("Variable '{}' removed.", name);
+ 			} else {
+ 				eprintln!("Undefined variable '{}'", name);
+ 			}
+ 			continue;
+ 		}
+ 		if trimmed == "list" {
+ 			if vars.is_empty() {
+ 				println!("(no variables defined)");
+ 			} else {
+ 				let mut keys: Vec<&String> = vars.keys().collect();
+ 				keys.sort();
+ 				for k in keys {
+ 					println!("{} = {}", k, format_fixed_point(vars[k]));
+ 				}
+ 			}
+ 			continue;
+ 		}
+ 		if trimmed == "clear" {
+ 			vars.clear();
+ 			println!("All variables cleared.");
+ 			continue;
+ 		}
+ 		execute_expression(trimmed, &vars);
+ 	}
 }
 fn main() {
 	let args: Vec<String> = env::args().collect();
@@ -612,7 +772,7 @@ fn main() {
 				found_expr = true;
 				continue;
 			}
-			if let Some((name, val)) = parse_var_assignment(arg) {
+			if let Some((name, val)) = parse_var_assignment(arg, &vars) {
 				vars.insert(name, val);
 			} else {
 				expr_parts.push(arg.clone());
