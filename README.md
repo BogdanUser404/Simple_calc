@@ -21,6 +21,7 @@ Operators:
 * `gcd` — Greatest Common Divisor (GCD)
 * `lcm` — Least Common Multiple (LCM)
 * `rand` — Random number 
+* `FUNCNAME[args]` - Call the fucntion 
 
 Example: 
 ```bash
@@ -32,5 +33,7 @@ calc "(2+2)*2" #8
 This math engine is based on a recursive stack. 
 
 Each parenthesis on the main math stack opens a new stack, which is evaluated, and the result of the child stack's calculations is delivered to the call site. 
+The parser simply assembles the math st
+ack from strings.
 
-The parser simply assembles the math stack from strings.
+[Function Doc](./doc/function.md)
