@@ -162,7 +162,7 @@ impl MathStack {
 			}
 		}
 
-		// 5. Low priority: Basic & bitwise logic (+, -, &, |, xor, ¬|, ¬&)
+		// 5. Low priority: Basic & bitwise logic (+, -, &, |, xor, ¬|, ¬&).
 		let mut total_val = self.numbers[0];
 		for (i, op) in self.operators.iter().enumerate() {
 			if i + 1 >= self.numbers.len() {
@@ -183,6 +183,68 @@ impl MathStack {
 
 		Ok(total_val)
 	}
+
+	/// Collapses every comparison on this stack into fixed-point booleans
+	/// (1 or 0). Comparison operators: БОЛЬШЕ (`>`), МЕНЬШЕ (`<`), РАВНО
+	/// (`=`/`==`), НЕ_РАВНО (`!=`/`≠`), НЕ_БОЛЬШЕ (`<=`), НЕ_МЕНЬШЕ (`>=`).
+	///
+	/// Semantics:
+	///   * Chained comparisons behave like Rust: `a < b < c` means
+	///     `(a < b) AND (b < c)`; the shared middle value `b` is reused as
+	///     the left operand of the next link and the boolean results are
+	///     combined with a spliced bitwise `&` (exact for 0/SCALE values).
+	///   * Result type is numeric: 1 (истина) или 0 (ложь) — совместимо со
+	///     всей остальной арифметикой движка, поэтому `(1 > 2) + 1` = 1.
+	pub fn evaluate_comparisons(&mut self) -> Result<(), &'static str> {
+		while let Some(pos) = self.operators.iter().position(|o| is_comparison_op(o)) {
+			if pos + 1 >= self.numbers.len() {
+				return Err("Missing operand for comparison operator");
+			}
+			let a = self.numbers[pos];
+			let b = self.numbers[pos + 1];
+			let res = compare_values(&self.operators[pos], a, b)?;
+			let chained_right = self.operators.get(pos + 1)
+				.map(|o| is_comparison_op(o.as_str()))
+				.unwrap_or(false);
+			if chained_right {
+				// Drop `a`, KEEP `b` as the shared left operand of the next
+				// link, and splice `&` so the final fold computes
+				// `raw(a<b) & raw(b<c)` — logical AND on our 0/SCALE booleans.
+				self.numbers.remove(pos);
+				self.operators.insert(pos, "&".to_string());
+				self.operators.remove(pos + 2); // the comparison just folded
+			} else {
+				self.numbers[pos] = res; // standalone (or last link): store bool
+				self.operators.remove(pos);
+			}
+		}
+		Ok(())
+	}
+}
+
+/// True when `op` is one of the comparison operators: БОЛЬШЕ (`>`),
+/// МЕНЬШЕ (`<`), РАВНО (`=`/`==`), НЕ_РАВНО (`!=`/`≠`), НЕ_БОЛЬШЕ (`<=`),
+/// НЕ_МЕНЬШЕ (`>=`).
+pub fn is_comparison_op(op: &str) -> bool {
+	matches!(op, ">" | "<" | "=" | "==" | "!=" | "≠" | "<=" | ">=")
+}
+
+/// Compares two fixed-point values (scale 10^8) and returns the boolean
+/// result scaled back to fixed-point (1 or 0). Exact integer comparison on
+/// the raw representation — no epsilon needed since every value shares the
+/// same scale.
+pub fn compare_values(op: &str, a: i128, b: i128) -> Result<i128, &'static str> {
+	const SCALE: i128 = 100_000_000;
+	let result = match op {
+		">" => a > b,
+		"<" => a < b,
+		"=" | "==" => a == b,
+		"!=" | "≠" => a != b,
+		"<=" => a <= b,
+		">=" => a >= b,
+		_ => return Err("Not a comparison operator"),
+	};
+	Ok(if result { SCALE } else { 0 })
 }
 
 pub struct MathProcessor {
@@ -212,7 +274,10 @@ impl MathProcessor {
 		if self.storage.len() < 2 {
 			return Err("Unmatched closing bracket");
 		}
-		let current = self.storage.pop().unwrap();
+		let mut current = self.storage.pop().unwrap();
+		// Resolve comparisons at THIS bracket level before handing a single
+		// value upward, so `(1 > 2) + 1` becomes `0 + 1` → 1.
+		current.evaluate_comparisons()?;
 		let result = current.evaluate_with_processor(&mut self.op_count, &self.rand_engine)?;
 		self.current_mut()?.push_num(result);
 		Ok(())
@@ -222,6 +287,11 @@ impl MathProcessor {
 		if self.storage.len() != 1 {
 			return Err("Unmatched opening brackets");
 		}
-		self.storage.pop().unwrap().evaluate_with_processor(&mut self.op_count, &self.rand_engine)
+		let mut current = self.storage.pop().unwrap();
+		// Top-level expression: comparisons collapse into 1/0 booleans
+		// first, then the remaining arithmetic/bitwise fold produces the
+		// final value.
+		current.evaluate_comparisons()?;
+		current.evaluate_with_processor(&mut self.op_count, &self.rand_engine)
 	}
 }
