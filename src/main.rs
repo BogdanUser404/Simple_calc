@@ -3,6 +3,8 @@
 pub mod math_proccessor;
 pub mod math_operations;
 mod parser;
+pub mod branching;
+use crate::branching::Branch;
 use std::collections::HashMap;
 use std::env;
 use std::fs;
@@ -282,13 +284,201 @@ fn parse_function_call(expr: &str) -> Option<(String, Vec<String>)> {
 	
 	Some((name, args))
 }
+/// Scans `expr` for the next complete `IF[...]:(...):(...)` construct,
+/// starting at byte offset `from`. Returns `(start, end)` where `start` is
+/// the index of the `I` character and `end` is the index just past the
+/// closing `)` of the ELSE group.
+///
+/// Bracket matching uses a single depth counter over `(`/`)`/`[`/`]`, so
+/// function calls like `gcd[a,b]` inside any part are handled correctly.
+/// Nested IF constructs are resolved recursively (innermost-first via
+/// `eval_branch_part`), therefore this scanner deliberately matches only
+/// *balanced* constructs: if an inner `IF[` is found while scanning the
+/// condition, its own full `IF[..]:(..):(..)` span is skipped atomically
+/// before continuing. If no balanced form exists, `None` is returned and
+/// the outer search resumes after the failed prefix.
+///
+/// Made `pub` so that `crate::branching::Branch::parse` can reuse it when
+/// skipping nested IF constructs inside a condition body.
+pub fn find_if_construct(expr: &str, from: usize) -> Option<(usize, usize)> {
+    let bytes = expr.as_bytes();
+
+    // Consumes one "(...)" group starting at `p` (which must point at '(');
+    // returns the index just past the matching ')'.
+    let skip_group = |bytes: &[u8], mut p: usize| -> Option<usize> {
+        if bytes.get(p) != Some(&b'(') {
+            return None;
+        }
+        let mut d = 0i32;
+        while p < bytes.len() {
+            match bytes[p] {
+                b'(' => d += 1,
+                b')' => {
+                    d -= 1;
+                    if d == 0 {
+                        return Some(p + 1);
+                    }
+                }
+                _ => {}
+            }
+            p += 1;
+        }
+        None
+    };
+
+    let mut i = from;
+    while i + 2 < bytes.len() {
+        // Locate the "IF[" prefix.
+        if bytes[i] == b'I' && bytes[i + 1] == b'F' && bytes[i + 2] == b'[' {
+            let start = i;
+            let mut pos = i + 3; // first byte of the condition text
+            let mut depth: i32 = 1; // we are inside the '[' of "IF["
+            let mut ok = true;
+            let mut cond_end = usize::MAX;
+
+            // 1. Walk to the condition's closing ']': the first ']' that
+            //    brings the depth back to 0. Inner complete IF constructs
+            //    encountered along the way are skipped as atomic units.
+            loop {
+                if pos >= bytes.len() {
+                    ok = false;
+                    break;
+                }
+                // Nested "IF[" — jump over the whole inner construct so its
+                // brackets never interfere with this level's depth counting.
+                if bytes[pos] == b'I'
+                    && bytes.get(pos + 1) == Some(&b'F')
+                    && bytes.get(pos + 2) == Some(&b'[')
+                {
+                    if let Some((_, inner_end)) = find_if_construct(expr, pos) {
+                        pos = inner_end;
+                        continue;
+                    }
+                    ok = false; // malformed inner construct — not ours either
+                    break;
+                }
+                match bytes[pos] {
+                    b'(' | b'[' => depth += 1,
+                    b')' | b']' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            if bytes[pos] == b']' {
+                                cond_end = pos;
+                            } else {
+                                ok = false; // mismatched ')' — invalid
+                            }
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+                pos += 1;
+            }
+
+            if ok {
+                // 2. Expect ':' followed by the THEN group "(...)".
+                pos = cond_end + 1;
+                if bytes.get(pos) == Some(&b':') {
+                    if let Some(after_then) = skip_group(bytes, pos + 1) {
+                        // 3. Expect ':' followed by the ELSE group "(...)".
+                        if bytes.get(after_then) == Some(&b':') {
+                            if let Some(end) = skip_group(bytes, after_then + 1) {
+                                return Some((start, end));
+                            }
+                        }
+                    }
+                }
+            }
+
+            // The prefix at `start` did not form a valid construct; resume
+            // scanning right after it instead of re-testing every byte.
+            i = start + 3;
+            continue;
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Evaluates one sub-expression of a branch: expands `{placeholder}`
+/// variables, then recursively replaces any nested IF constructs with
+/// their lazily-computed numeric literals, and finally runs the result
+/// through the engine's parser/processor.
+fn eval_branch_part(expr: &str, vars: &HashMap<String, i128>) -> Result<i128, String> {
+    let with_vars = apply_placeholders(expr, vars)?;
+    let expanded = expand_if_constructs(&with_vars, vars)?;
+    let mut processor = MathProcessor::new();
+    ParsingEngine::parse_into_processor(&expanded, &mut processor)
+        .map_err(|e| format!("Parse error in branch expression '{}': {}", expanded, e))?;
+    processor
+        .finalize()
+        .map_err(|e| format!("Evaluation error in branch expression '{}': {}", expanded, e))
+}
+
+/// Lazily evaluates a single IF construct body (the text after `IF[`):
+/// only the condition and the ONE taken arm are evaluated — the untaken
+/// arm is never parsed or evaluated, so errors inside it (e.g. division
+/// by zero) never surface.
+fn evaluate_single_branch(if_body: &str, vars: &HashMap<String, i128>) -> Result<i128, String> {
+    let branch = Branch::parse(if_body).map_err(|e| e.to_string())?;
+    // NOTE: `eval_lazily_with` calls the closure exactly twice — once for
+    // the condition and once for the TAKEN arm only. The untaken arm's
+    // text never reaches `eval_branch_part`, so nested constructs inside
+    // it are not evaluated either (full laziness).
+    branch.eval_lazily_with(|part| eval_branch_part(part, vars))
+}
+
+/// Replaces every top-level `IF[cond]:(then):(else)` construct found in
+/// `expr` with the numeric literal result of its lazy evaluation. Each
+/// part of a construct is evaluated via `eval_branch_part`, which calls
+/// this function again on the taken arm — giving natural recursive (and
+/// still lazy) handling of nested IFs.
+fn expand_if_constructs(expr: &str, vars: &HashMap<String, i128>) -> Result<String, String> {
+    let mut current = expr.to_string();
+
+    for _ in 0..64 {
+        match find_if_construct(&current, 0) {
+            None => return Ok(current),
+            Some((if_start, body_end)) => {
+                // Body of the IF: everything between "IF[" and the end of
+                // the ELSE group.
+                let body = &current[if_start + 3..body_end];
+                let result = evaluate_single_branch(body, vars)?;
+                let literal = format_fixed_point(result);
+                current = format!("{}{}{}", &current[..if_start], literal, &current[body_end..]);
+            }
+        }
+    }
+    Err("Too deeply nested IF constructs".to_string())
+}
+
+/// Entry point used by `execute_expression`: expands all IF constructs
+/// (lazily, recursively, with placeholder support) before the remaining
+/// arithmetic is evaluated by the main processor.
+fn expand_branches(expr: &str, vars: &HashMap<String, i128>) -> Result<String, String> {
+    let with_vars = apply_placeholders(expr, vars)?;
+    expand_if_constructs(&with_vars, vars)
+}
+
 fn execute_expression(expr: &str, vars: &HashMap<String, i128>) {
 	if expr.trim().is_empty() {
 		return;
 	}
-	
+
+	// Expand all lazy IF constructs first (recursively, placeholders
+	// included). This must happen BEFORE the user-function dispatch,
+	// otherwise expressions like "IF[...]:(...):(...)" would be mistaken
+	// for a call to a user-defined function named "IF".
+	let expanded = match expand_branches(expr, vars) {
+		Ok(s) => s,
+		Err(e) => {
+			eprintln!("Branch Error: {}", e);
+			return;
+		}
+	};
+
 	// Check if it's a function call
-	if let Some((func_name, arg_strs)) = parse_function_call(expr) {
+	if let Some((func_name, arg_strs)) = parse_function_call(&expanded) {
 		let mut arg_values = Vec::new();
 		for arg_str in arg_strs {
 			let expanded = match apply_placeholders(&arg_str, vars) {
@@ -336,15 +526,8 @@ fn execute_expression(expr: &str, vars: &HashMap<String, i128>) {
 		return;
 	}
 	
-	// Regular expression
-	let expanded = match apply_placeholders(expr, vars) {
-		Ok(s) => s,
-		Err(e) => {
-			eprintln!("Placeholder Error: {}", e);
-			return;
-		}
-	};
-	
+	// Plain expression: IF constructs are already expanded above;
+	// evaluate the remaining arithmetic through the processor.
 	let mut processor = MathProcessor::new();
 	match ParsingEngine::parse_into_processor(&expanded, &mut processor) {
 		Ok(_) => {
